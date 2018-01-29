@@ -22,21 +22,73 @@ def find_all_files(directory):
             yield os.path.join(root, file)
 
 def get_chrome_cache_dir():
-    
     if platform == "Windows":
         return os.path.join(os.getenv("LOCALAPPDATA"), r"Google\Chrome\User Data\Default\Cache")
+    elif platform == "Darwin":
+        # Library/Caches/com.google.chrome ?
+        return os.path.join(os.getenv("HOME"), r"Library/Application Support/Google/Chrome/Default/Application Cache")
     else:
         raise NotImplementedError("{} is not supported".format(platform))
 
 def get_firefox_cache_dir():
     if platform == "Windows":
         base = os.path.join(os.getenv("LOCALAPPDATA"), r"Mozilla\Firefox\Profiles")
+    elif platform == "Darwin":
+        base = os.path.join(os.getenv("HOME"), r"Library/Caches/Firefox/Profiles")
     else:
         raise NotImplementedError("{} is not supported".format(platform))
     for f in find_all_files(base):
-        if os.path.isdir(f) and "cache" in f:
+        if os.path.isdir(f) and ("cache" in f or "Cache" in f):
             return f
     return None
+
+class GsubAnalyzer(object):
+    def __init__(self, font_path):
+        self.font = TTFont(font_path)
+        self.gsub = self.font["GSUB"]
+        self.lang_system = {}
+        self.lookup_indexes = []
+        self.features = set()
+
+    def analyze(self):
+        self._analyze_script()
+        for script_tag in self.lang_system.keys():
+            for lang_sys_tag in self.lang_system[script_tag].keys():
+                feature_indexes = self.lang_system[script_tag][lang_sys_tag]
+                feature_records = [self.gsub.table.FeatureList.FeatureRecord[idx] for idx in feature_indexes]
+                for record in feature_records:
+                    self.features.add(record.FeatureTag)
+
+    def _analyze_script(self):
+        for record in self.gsub.table.ScriptList.ScriptRecord:
+            self.lang_system[record.ScriptTag] = {}
+            self.lang_system[record.ScriptTag]["dflt"] = [idx for idx in record.Script.DefaultLangSys.FeatureIndex]
+            for lang_record in record.Script.LangSysRecord:
+                self.lang_system[record.ScriptTag][lang_record.LangSysTag] = [idx for idx in lang_record.LangSys.FeatureIndex]
+
+class GposAnalyzer(object):
+    def __init__(self, font_path):
+        self.font = TTFont(font_path)
+        self.gpos = self.font["GPOS"]
+        self.lang_system = {}
+        self.lookup_indexes = []
+        self.features = set()
+
+    def analyze(self):
+        self._analyze_script()
+        for script_tag in self.lang_system.keys():
+            for lang_sys_tag in self.lang_system[script_tag].keys():
+                feature_indexes = self.lang_system[script_tag][lang_sys_tag]
+                feature_records = [self.gpos.table.FeatureList.FeatureRecord[idx] for idx in feature_indexes]
+                for record in feature_records:
+                    self.features.add(record.FeatureTag)
+
+    def _analyze_script(self):
+        for record in self.gpos.table.ScriptList.ScriptRecord:
+            self.lang_system[record.ScriptTag] = {}
+            self.lang_system[record.ScriptTag]["dflt"] = [idx for idx in record.Script.DefaultLangSys.FeatureIndex]
+            for lang_record in record.Script.LangSysRecord:
+                self.lang_system[record.ScriptTag][lang_record.LangSysTag] = [idx for idx in lang_record.LangSys.FeatureIndex]
 
 # https://github.com/fonttools/fonttools/blob/master/Snippets/woff2_decompress.py
 class WoffDecompressor(object):
@@ -63,7 +115,9 @@ class WoffDecompressor(object):
         return outfilename
 
 class WebfontAnalyzer(object):
-    def __init__(self, basedir=get_firefox_cache_dir()):
+    def __init__(self, basedir=None):
+        if basedir is None:
+            basedir=get_firefox_cache_dir()
         self.basedir = basedir
 
     def run(self):
@@ -75,15 +129,28 @@ class WebfontAnalyzer(object):
 
     def analyze_woff(self, f):
         decomp = WoffDecompressor(f)
-        path = decomp.run()
-        font = TTFont(path)
+        font_path = decomp.run()
+        font = TTFont(font_path)
+        font_name = self.get_font_name(font)
+
+        print("[{}]".format(font_name))
+        if "GSUB" in font:
+            gsub = GsubAnalyzer(font_path)
+            gsub.analyze()
+            print("  GSUB: {}".format(",".join(sorted(gsub.features))))
+        if "GPOS" in font:
+            gpos = GposAnalyzer(font_path)
+            gpos.analyze()
+            print("  GPOS: {}".format(",".join(sorted(gsub.features))))
+
+    def get_font_name(self, font):
         name = font["name"]
         ok = True
         try:
             name_record = name.getName(nameID=6, platformID=1, platEncID=0)
             encoding = name_record.getEncoding("utf-8")
             s = name_record.string.decode(encoding)
-            print(s)
+            return s
         except Exception as e:
             #print(e)
             ok = False
@@ -92,10 +159,11 @@ class WebfontAnalyzer(object):
                 name_record = name.getName(nameID=6, platformID=3, platEncID=1)
                 encoding = name_record.getEncoding("utf-8")
                 s = name_record.string.decode(encoding)
-                print(s)
+                return s
             except Exception as e:
                 #print(e)
                 ok = False
+        return None
 
     def is_woff(self, file):
         global py_ver
@@ -109,7 +177,9 @@ class WebfontAnalyzer(object):
             else:
                 return buf[0] == ord('w') and buf[1] == ord('O') and buf[2] == ord('F') and buf[3] == ord('F')
 
-    def is_recent_file(self, file):
+    def is_recent_file(self, file, always_recent=False):
+        if always_recent:
+            return True
         now = datetime.datetime.now()
         dt = datetime.datetime.fromtimestamp(os.stat(file).st_mtime)
         elapsed = (now - dt).total_seconds()
@@ -118,15 +188,15 @@ class WebfontAnalyzer(object):
 def get_args():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    #parser.add_argument("in_xxx", metavar="XXX", type=str,
-    #                    help="input xxx")
+    parser.add_argument("-d", "--dir", dest="basedir", default=None,
+                        help="directory where web fonts are searched")
     args = parser.parse_args()
 
     return args
 
 def main():
      args = get_args()
-     tool = WebfontAnalyzer()
+     tool = WebfontAnalyzer(args.basedir)
      sys.exit(tool.run())
 
 if __name__ == "__main__":
