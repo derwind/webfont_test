@@ -30,17 +30,18 @@ def get_chrome_cache_dir():
     else:
         raise NotImplementedError("{} is not supported".format(platform))
 
-def get_firefox_cache_dir():
+def get_firefox_cache_dirs():
     if platform == "Windows":
         base = os.path.join(os.getenv("LOCALAPPDATA"), r"Mozilla\Firefox\Profiles")
     elif platform == "Darwin":
         base = os.path.join(os.getenv("HOME"), r"Library/Caches/Firefox/Profiles")
     else:
         raise NotImplementedError("{} is not supported".format(platform))
+    dirs = set()
     for f in find_all_files(base):
         if os.path.isdir(f) and ("cache" in f or "Cache" in f):
-            return f
-    return None
+            dirs.add(f)
+    return dirs
 
 class GsubAnalyzer(object):
     def __init__(self, font_path):
@@ -115,20 +116,21 @@ class WoffDecompressor(object):
         return outfilename
 
 class WebfontAnalyzer(object):
-    def __init__(self, basedir=None):
-        if basedir is None:
-            basedir=get_firefox_cache_dir()
-        self.basedir = basedir
+    def __init__(self, basedirs=None):
+        if basedirs is None:
+            basedirs=get_firefox_cache_dirs()
+        self.basedirs = basedirs
 
     def run(self):
-        for f in find_all_files(self.basedir):
-            if os.path.isfile(f) and self.is_recent_file(f) and self.is_woff(f):
-                self.analyze_woff(f)
+        for basedir in self.basedirs:
+            for f in find_all_files(basedir):
+                if os.path.isfile(f) and self.is_recent_file(f) and self.is_woff(f):
+                    self.analyze_woff(f)
 
         return 0
 
-    def analyze_woff(self, f):
-        decomp = WoffDecompressor(f)
+    def analyze_woff(self, woff):
+        decomp = WoffDecompressor(woff)
         font_path = decomp.run()
         font = TTFont(font_path)
         font_name = self.get_font_name(font)
@@ -141,7 +143,7 @@ class WebfontAnalyzer(object):
         if "GPOS" in font:
             gpos = GposAnalyzer(font_path)
             gpos.analyze()
-            print("  GPOS: {}".format(",".join(sorted(gsub.features))))
+            print("  GPOS: {}".format(",".join(sorted(gpos.features))))
 
     def get_font_name(self, font):
         name = font["name"]
@@ -196,7 +198,8 @@ def get_args():
 
 def main():
      args = get_args()
-     tool = WebfontAnalyzer(args.basedir)
+     basedirs = [args.basedir] if args.basedir is not None else None
+     tool = WebfontAnalyzer(basedirs)
      sys.exit(tool.run())
 
 if __name__ == "__main__":
